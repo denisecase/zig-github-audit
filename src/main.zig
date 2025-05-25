@@ -1,91 +1,109 @@
 // src/main.zig
+// This Zig program fetches GitHub repositories for a given user
+// and writes repo names to a CSV file.
 
- // Import the standard library
 const std = @import("std");
+const max_per_page = 100;
+const output_file = "repos.csv";
 
-// Define the entry point of the program
-// return an error if something fails
 pub fn main() !void {
-
     std.debug.print("Starting main\n", .{});
+    var allocator = std.heap.page_allocator;
 
-     // Use page allocator for dynamic memory allocations
-    const allocator = std.heap.page_allocator;
+    var args = try std.process.ArgIterator.initWithAllocator(allocator);
+    defer args.deinit();
 
-    const username = "denisecase";
-    const url = try std.fmt.allocPrint(allocator,
-        "https://api.github.com/users/{s}/repos?per_page=30", .{username});
+    _ = args.next(); 
+
+    const username = args.next() orelse {
+        const stderr = std.io.getStdErr().writer();
+        try stderr.print(
+            \\ERROR: Missing GitHub username. 
+            \\Usage: zig build run -- <github-username>
+            \\Example: zig build run -- denisecase
+            \\Please try again. 
+            \\
+        , .{});
+        return;
+    };
+
+    std.debug.print("Starting fetch for user: {s}\n", .{username});
+
+    var page: usize = 1;
+    var total_count: usize = 0;
+
+    var file = try std.fs.cwd().createFile(output_file, .{});
+    defer file.close();
+    try file.writer().writeAll("name\n");
+
+    while (true) {
+        const repos = try fetchReposPage(username, page, &allocator);
+        defer repos.deinit();
+
+        const count = try writeRepoNamesToCSV(file.writer(), repos.value.array.items);
+        std.debug.print("Page {d}. {d} repos written\n", .{ page, count });
+
+        total_count += count;
+        if (repos.value.array.items.len < max_per_page) break;
+
+        page += 1;
+    }
+
+    std.debug.print("Wrote {d} total repositories to {s}\n", .{ total_count, output_file });
+}
+
+fn fetchReposPage(
+    username: []const u8,
+    page: usize,
+    allocator_ptr: *std.mem.Allocator,
+) !std.json.Parsed(std.json.Value) {
+
+    const url = try std.fmt.allocPrint(allocator_ptr.*, "https://api.github.com/users/{s}/repos?per_page={d}&page={d}", .{ username, max_per_page, page });
+    const allocator = allocator_ptr.*;
     defer allocator.free(url);
 
-    // Declare and defer cleanup of stdout buffer
+    std.debug.print("Fetching page {d}: {s}\n", .{ page, url });
+
     var stdout = std.ArrayListUnmanaged(u8){};
     defer stdout.deinit(allocator);
+    var stderr = std.ArrayListUnmanaged(u8){};
+    defer stderr.deinit(allocator);
 
-    // Initialize a child process that runs curl with the proper headers and URL
     var child = std.process.Child.init(&[_][]const u8{
         "curl", "-s", "-H", "User-Agent: zig-client", url,
     }, allocator);
 
-    // Pipe output of curl for reading
     child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
 
-    // Ignore any errors printed to stderr
-    child.stderr_behavior = .Ignore;
-
-    // Start the curl process
     try child.spawn();
-
-    // Access the stdout stream from the child process
-    const stdout_slice = stdout.items;    
-    defer allocator.free(stdout_slice);
-
-    // Wait for the process to finish (get exit status)
+    try child.collectOutput(allocator, &stdout, &stderr, 1_000_000);
     _ = try child.wait();
 
-    // alias just to shorten
-    const json = std.json;
-
-     // Parse the JSON response from GitHub into a dynamic structure
-    const parsed = try json.parseFromSlice(json.Value, allocator, stdout.items, .{});
-    
-    // Free the memory used by the parsed JSON
-    defer parsed.deinit();
-
-    const repos = parsed.value.array;
-
-    const repo_max = @min(repos.items.len, 3);
-
-    var file = try std.fs.cwd().createFile("repos.csv", .{});
-    // Ensure the file is closed when we’re done
-    defer file.close();
-
-    // Write CSV header
-    try file.writer().writeAll("name\n");
-
-    var repo_count: usize = 0;
-
-    // Loop over each repository object in the JSON array
-    for (repos.items) |repo| {
-        // Stop after 3 entries
-        if (repo_count >= repo_max) break;
-
-        // Get the "full_name" field (e.g., user/repo), skip if missing
-        const name_val = repo.object.get("full_name") orelse continue;
-        
-        // Skip if it's not a string
-        if (name_val != .string) continue;
-
-        // Extract the actual string value
-        const name = name_val.string;
-
-        // Print the repo name to debug output
-        std.debug.print("- {s}\n", .{name});
-
-        // Write to CSV file
-        try file.writer().print("{s}\n", .{name});
-
-        repo_count += 1;
+    if (stderr.items.len > 0) {
+        std.debug.print("stderr (page {d}):\n{s}\n", .{ page, stderr.items });
     }
 
-    std.debug.print("Wrote repos.csv with {} repositories.\n", .{repos.items.len});
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, stdout.items, .{});
+    return parsed;
 }
+
+fn writeRepoNamesToCSV(
+    writer: anytype,
+    repos: []const std.json.Value,
+) !usize {
+    var count: usize = 0;
+
+    for (repos) |repo| {
+        const name_val = repo.object.get("full_name") orelse continue;
+        if (name_val != .string) continue;
+
+        const name = name_val.string;
+        try writer.print("{s}\n", .{name});
+        std.debug.print("- {s}\n", .{name});
+        count += 1;
+    }
+
+    return count;
+}
+

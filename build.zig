@@ -1,5 +1,3 @@
-// build.zig
-
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -13,10 +11,12 @@ pub fn build(b: *std.Build) void {
         .optimize = mode,
     });
 
-    b.installArtifact(exe);
+    b.installArtifact(exe); // installs to zig-out/bin/github_audit(.exe)
 
-    // Add the `run` step:
     const run_cmd = b.addRunArtifact(exe);
-    b.step("run", "Run the GitHub audit tool").dependOn(&run_cmd.step);
-}
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
+    }
 
+    b.step("run", "Build and run").dependOn(&run_cmd.step);
+}
